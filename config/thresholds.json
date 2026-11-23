@@ -1,0 +1,22 @@
+{
+  "_comment": "Percent values are whole numbers (25 means 25 percent). Volume guards stop small campaigns from creating noise.",
+  "currency_code": "USD",
+  "currency_symbol": "$",
+  "cpa_up_pct": 25,
+  "cpa_down_pct": 25,
+  "cpa_min_conversions": 10,
+  "ctr_down_pct": 20,
+  "ctr_min_impressions": 10000,
+  "spend_up_pct": 30,
+  "spend_up_min_prior_spend": 200,
+  "zero_conversions_min_spend": 250,
+  "new_or_stopped_min_spend": 100,
+  "median_min_campaigns_per_tag": 3,
+  "median_min_conversions": 3,
+  "median_min_impressions": 5000,
+  "median_inline_pct": 5,
+  "tags_from_names": {
+    "delimiter": "_",
+    "positions": {"objective": 1, "creative": 2}
+  }
+}
