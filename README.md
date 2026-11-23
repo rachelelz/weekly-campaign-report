@@ -68,10 +68,10 @@ Claude runs the script, reads the data notes first, and writes a summary of at m
 ## What it won't do
 
 - Add up conversions as if they were unique customers. Each platform counts conversions its own way, and the report says so under the totals.
-- Convert currencies. Everything is treated as one currency, and the data notes say which.
+- Convert currencies. Everything is treated as one currency. If an export's currency doesn't match the one in `config/thresholds.json`, the report says so at the top.
 - Explain why a campaign changed, since that isn't in any export.
 
-The column names are written from each platform's standard export format, and the demo files are made up. They haven't been tested against a live account's export yet. Any column the script doesn't recognize is listed under "Data notes", so a renamed column shows up instead of disappearing.
+The column names are written from each platform's standard export format, and the demo files are made up. They haven't been tested against a live account's export yet. Any column the script doesn't recognize is listed under "Data notes", so a renamed column shows up instead of disappearing. European number formats like `1.234,56` are detected per file, or you can force them with `--decimal-comma`, and the data notes say how each file was read.
 
 ## Privacy
 
@@ -81,7 +81,7 @@ The script reads the CSVs you give it, writes to `out/`, and sends nothing anywh
 
 - ROAS was wrong on the first run. LinkedIn's export has no revenue column, but its spend was still counted, which made return on ad spend look worse than it was. ROAS now only uses spend from platforms that report revenue, and the report says which platforms it left out.
 - Every campaign looked new. When the chosen week had no data for the week before, every campaign was flagged as newly launched, and the top line announced a brand campaign that had been running all along. New-campaign flags now switch off when there's no previous week to compare with.
-- All 40 tests passed on the first run. That's suspicious for a first run, so I checked the spend and conversion totals for each platform separately against the raw CSVs, and read the tests that assert specific numbers. They held up. The test for the "every campaign looked new" bug came after.
+- The first version's 40 tests all passed on the first run. That's suspicious, so I checked the spend and conversion totals for each platform separately against the raw CSVs, and read the tests that assert specific numbers. They held up. The test for the "every campaign looked new" bug came after.
 
 ## What I'd change next
 
@@ -99,7 +99,7 @@ config/thresholds.json      flag thresholds, volume guards, campaign-name tag ru
 config/tags.template.csv    optional campaign tags
 examples/exports/           two weeks of made-up exports for each platform
 examples/sample-report.md   the demo output
-tests/test_report.py        41 offline tests: python3 -m unittest discover tests
+tests/test_report.py        50 offline tests: python3 -m unittest discover tests
 ```
 
 ## License

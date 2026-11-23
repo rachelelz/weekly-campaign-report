@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -325,6 +326,98 @@ class EndToEndTests(unittest.TestCase):
 
     def test_report_has_no_fake_zero_for_missing_values(self):
         self.assertIn("| Q1_Prospecting_Document_US (LinkedIn) | $910 | 0 | n/a |", self.markdown)
+
+
+class NumberFormatTests(unittest.TestCase):
+    def read(self, text, **kwargs):
+        with tempfile.TemporaryDirectory() as tmp:
+            return report.read_export(write(tmp, "m.csv", text), COLS, **kwargs)
+
+    def test_euro_with_symbol_is_comma_decimal(self):
+        result = self.read('Day,Campaign,Cost,Impr.\n2026-03-02,A,"\u20ac100,00","1.000"\n')
+        self.assertEqual(result["number_style"], "comma")
+        self.assertEqual(result["rows"][0]["spend"], 100.0)
+        self.assertEqual(result["rows"][0]["impressions"], 1000.0)
+        self.assertEqual(result["currency"], "EUR")
+
+    def test_dotted_thousands_with_comma_decimal(self):
+        result = self.read('Day,Campaign,Cost\n2026-03-02,A,"1.234,56"\n')
+        self.assertEqual(result["number_style"], "comma")
+        self.assertEqual(result["rows"][0]["spend"], 1234.56)
+
+    def test_us_file_stays_us(self):
+        result = self.read('Day,Campaign,Cost\n2026-03-02,A,"1,234.50"\n2026-03-03,A,"99.10"\n')
+        self.assertEqual(result["number_style"], "us")
+        self.assertEqual(result["rows"][0]["spend"], 1234.5)
+
+    def test_ambiguous_file_keeps_us_reading(self):
+        result = self.read('Day,Campaign,Cost\n2026-03-02,A,"1,234"\n')
+        self.assertEqual(result["number_style"], "ambiguous")
+        self.assertEqual(result["rows"][0]["spend"], 1234.0)
+        notes = report.file_notes([result], TH)
+        self.assertTrue(any("ambiguous" in n and "m.csv" in n and "US style" in n for n in notes))
+
+    def test_forced_decimal_comma(self):
+        result = self.read('Day,Campaign,Cost\n2026-03-02,A,"1,234"\n', decimal_comma=True)
+        self.assertEqual(result["rows"][0]["spend"], 1.234)
+        notes = report.file_notes([result], TH)
+        self.assertTrue(any("European style" in n and "--decimal-comma" in n for n in notes))
+
+    def test_comma_file_always_gets_a_note(self):
+        result = self.read('Day,Campaign,Cost\n2026-03-02,A,"100,00"\n')
+        notes = report.file_notes([result], TH)
+        self.assertTrue(any("m.csv" in n and "European style" in n for n in notes))
+
+    def test_currency_mismatch_shows_in_opening_lines(self):
+        rows = "".join('2026-03-%02d,A,"100,00",1000,20,2\n' % d for d in range(2, 16))
+        header = "Reporting starts,Campaign name,Amount spent (EUR),Impressions,Link clicks,Results\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(tmp, "eur.csv", header + rows)
+            markdown, summary = report.run([str(path)])
+        self.assertEqual(summary["totals"]["current"]["spend"], 700.0)
+        top = markdown.split("## Totals")[0]
+        self.assertIn("eur.csv (EUR)", top)
+        self.assertIn("Check the currency", top)
+
+
+class WorkingFolderTests(unittest.TestCase):
+    def run_cli(self, cwd, *args):
+        return subprocess.run([sys.executable, str(ROOT / "scripts" / "report.py")] + list(args),
+                              cwd=str(cwd), capture_output=True, text=True)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = Path(self.tmp.name)
+        exports = self.work / "exports"
+        exports.mkdir()
+        for p in (ROOT / "examples" / "exports").glob("*.csv"):
+            (exports / p.name).write_bytes(p.read_bytes())
+        (self.work / "tags.csv").write_bytes((ROOT / "examples" / "tags.example.csv").read_bytes())
+        self.repo_out = ROOT / "out"
+        self.before = sorted(self.repo_out.rglob("*")) if self.repo_out.exists() else None
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def assert_repo_untouched(self):
+        after = sorted(self.repo_out.rglob("*")) if self.repo_out.exists() else None
+        self.assertEqual(self.before, after)
+
+    def test_default_output_goes_to_working_folder(self):
+        done = self.run_cli(self.work, "exports/meta-ads.example.csv", "exports/google-ads.example.csv",
+                            "--tags", "tags.csv")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.work / "out" / "report.md").exists())
+        self.assertTrue((self.work / "out" / "summary.json").exists())
+        self.assert_repo_untouched()
+
+    def test_summary_goes_next_to_custom_report(self):
+        done = self.run_cli(self.work, "exports/meta-ads.example.csv", "--out", "report.md")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.work / "report.md").exists())
+        self.assertTrue((self.work / "summary.json").exists())
+        self.assertFalse((self.work / "out").exists())
+        self.assert_repo_untouched()
 
 
 if __name__ == "__main__":

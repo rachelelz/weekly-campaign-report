@@ -7,6 +7,8 @@ description: Turns last week's ad platform CSV exports (Meta Ads Manager, Google
 
 The script does the math. You write the words. Never the other way around.
 
+Paths: `<skill>` means the folder this SKILL.md is in (for example `~/.claude/skills/weekly-campaign-report`). Run every command from the user's data folder. The exports, `tags.csv` and `out/` live there, not in the skill folder.
+
 ## Step 1: Get the exports
 
 Ask which platforms the user runs and whether they have last week's CSVs. If not, give them the short pointer for each platform. Ask for two full weeks of daily rows (14 days), so the script can compare this week with the one before.
@@ -17,21 +19,22 @@ Ask which platforms the user runs and whether they have last week's CSVs. If not
 
 Menu names change between releases. If a pointer does not match what the user sees, name the columns you need and let them find the export.
 
-Optional: a `tags.csv` (copy `config/tags.template.csv`) with one row per campaign and columns such as audience or offer. Campaign names like `Q1_Prospecting_Video_US` are also read as tags (see `tags_from_names` in `config/thresholds.json`).
+Optional: a `tags.csv` (copy it with `cp <skill>/config/tags.template.csv tags.csv`) with one row per campaign and columns such as audience or offer. Campaign names like `Q1_Prospecting_Video_US` are also read as tags (see `tags_from_names` in `config/thresholds.json`).
 
-Exports usually live in an `exports/` folder at the repo root. That folder is git-ignored.
+Exports usually live in an `exports/` folder in the user's data folder.
 
 ## Step 2: Run the script
 
 ```bash
-python3 scripts/report.py exports/*.csv --tags tags.csv --week-ending 2026-03-15
+python3 <skill>/scripts/report.py exports/*.csv --tags tags.csv --week-ending 2026-03-15
 ```
 
 - Leave out `--week-ending` to use the latest date in the data.
 - Add `--platform meta|google|linkedin` only if the script cannot detect a platform.
-- Try `python3 scripts/report.py --demo` to see the output on the example data.
+- Try `python3 <skill>/scripts/report.py --demo` to see the output on the example data.
+- For European exports with numbers like `1.234,56`, add `--decimal-comma`. The script also detects this on its own and says so in the Data notes.
 
-It writes `out/report.md` and `out/summary.json`.
+It writes `out/report.md` and `out/summary.json` in the data folder.
 
 ## Step 3: Read before you write
 

@@ -8,6 +8,9 @@ library only.
 
     python3 scripts/report.py exports/*.csv --tags tags.csv --week-ending 2026-03-15
     python3 scripts/report.py --demo
+
+Relative paths (exports, --tags, --out) resolve against the folder you run
+the command from. Only --demo reads and writes inside the tool's own folder.
 """
 import argparse
 import csv
@@ -32,16 +35,52 @@ SHORT_PLATFORM = {"meta": "Meta", "google": "Google", "linkedin": "LinkedIn"}
 
 # ---------------------------------------------------------------- parsing
 
-def parse_number(text):
+COMMA_DECIMAL = re.compile(r"\d,\d{1,2}$|\d{1,3}(\.\d{3})+,\d+$")
+DOT_DECIMAL = re.compile(r"\d\.\d{1,2}$|\d{1,3}(,\d{3})+\.\d+$")
+GROUPED_ONLY = re.compile(r"\d{1,3}([,.]\d{3})+$")
+CURRENCY_SYMBOLS = {"\u20ac": "EUR", "\u00a3": "GBP", "$": "USD"}
+
+
+def number_text(text):
+    """The digits, dots, commas and minus sign of a cell ('\u20ac1.234,56' gives '1.234,56')."""
+    return re.sub(r"[^\d.,\-]", "", str(text).strip())
+
+
+def detect_number_style(cells):
+    """Decide how one file writes numbers. Returns 'comma', 'us' or 'ambiguous'.
+    'comma' means 1.234,56 (comma decimal). 'ambiguous' means the only evidence is
+    values like 1,234, so the US reading is kept."""
+    comma = dot = grouped = 0
+    for cell in cells:
+        cleaned = number_text(cell)
+        if COMMA_DECIMAL.search(cleaned):
+            comma += 1
+        elif DOT_DECIMAL.search(cleaned):
+            dot += 1
+        elif GROUPED_ONLY.search(cleaned):
+            grouped += 1
+    if comma and not dot:
+        return "comma"
+    if comma or grouped and not dot:
+        return "ambiguous"
+    return "us"
+
+
+def parse_number(text, decimal_comma=False):
     """Turn '$1,234.50', '12%', '(5)' into a float. Placeholders like '--' give None.
-    Raises ValueError for text that is not a number at all."""
+    With decimal_comma, '1.234,56' is read as 1234.56. Raises ValueError for text
+    that is not a number at all."""
     if text is None:
         return None
     raw = str(text).strip()
     if raw.lower() in PLACEHOLDERS:
         return None
     negative = raw.startswith("(") and raw.endswith(")")
-    cleaned = re.sub(r"[^\d.,\-]", "", raw).replace(",", "")
+    cleaned = number_text(raw)
+    if decimal_comma:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    else:
+        cleaned = cleaned.replace(",", "")
     if not re.search(r"\d", cleaned):
         raise ValueError("cannot read number: %r" % raw)
     try:
@@ -126,12 +165,13 @@ def detect_platform(header, cols):
     return best if scores[best] > 0 else "unknown"
 
 
-def read_export(path, cols, platform=None):
+def read_export(path, cols, platform=None, decimal_comma=False):
     """Read one CSV export. Returns a dict with rows and notes about what was skipped."""
     path = Path(path)
     result = {"file": path.name, "rows": [], "platform": None, "preamble_lines": 0,
               "unknown_columns": [], "skipped": Counter(), "blank_cells": Counter(),
-              "currency": None, "error": None}
+              "currency": None, "number_style": "us", "forced_decimal_comma": False,
+              "error": None}
     text = decode_bytes(path.read_bytes())
     found = None
     for delimiter in (",", "\t", ";"):
@@ -150,6 +190,7 @@ def read_export(path, cols, platform=None):
     match = re.search(r"\(([A-Za-z]{3})\)", header[mapping["spend"]])
     result["currency"] = match.group(1).upper() if match else None
 
+    data = []
     for cells in table[start + 1:]:
         if not any(c.strip() for c in cells):
             continue
@@ -162,13 +203,29 @@ def read_export(path, cols, platform=None):
         if not name or name == "--":
             result["skipped"]["no campaign name"] += 1
             continue
+        data.append((cells, day, name))
+
+    fields = [f for f in METRICS if f in mapping]
+    if decimal_comma:
+        style = "comma"
+        result["forced_decimal_comma"] = True
+    else:
+        style = detect_number_style(cells[mapping[f]] for cells, _, _ in data for f in fields)
+    result["number_style"] = style
+    if not result["currency"]:
+        symbols = {CURRENCY_SYMBOLS[ch] for cells, _, _ in data
+                   for ch in cells[mapping["spend"]] if ch in CURRENCY_SYMBOLS}
+        if len(symbols) == 1:
+            result["currency"] = symbols.pop()
+
+    for cells, day, name in data:
         row = {"platform": result["platform"], "campaign": name, "date": day}
         try:
             for field in METRICS:
                 if field not in mapping:
                     row[field] = None
                     continue
-                value = parse_number(cells[mapping[field]])
+                value = parse_number(cells[mapping[field]], style == "comma")
                 if value is None:
                     result["blank_cells"][field] += 1
                     value = 0.0
@@ -578,6 +635,13 @@ def file_notes(results, th):
         if r["blank_cells"]:
             cells = ", ".join("%s (%d)" % kv for kv in sorted(r["blank_cells"].items()))
             notes.append("%s: blank or '--' cells read as 0 in %s." % (r["file"], cells))
+        if r["number_style"] == "comma":
+            notes.append("%s: numbers read as European style (comma decimal, dot thousands)%s." % (
+                r["file"], ", as set by --decimal-comma" if r["forced_decimal_comma"] else ""))
+        elif r["number_style"] == "ambiguous":
+            notes.append("%s: the number format was ambiguous (values like 1,234 could be either style). "
+                         "Assumed US style: comma for thousands, dot for decimals. If this is a European "
+                         "export, run again with --decimal-comma." % r["file"])
         if r["currency"] and r["currency"] != th["currency_code"]:
             notes.append("%s: the spend header says %s but the report assumes %s." % (
                 r["file"], r["currency"], th["currency_code"]))
@@ -613,6 +677,11 @@ def render_markdown(s, f):
            "Week ending %s. This week is %s, compared with %s. Every figure comes from the exports "
            "you supplied." % (s["week_ending"], window_label(cur_w), window_label(prev_w)), "",
            "## Totals", ""]
+    if s.get("currency_mismatch"):
+        out[6:6] = ["Check the currency first: %s uses a different currency than %s. This report shows "
+                    "every amount as %s and does not convert. Set `currency_code` and `currency_symbol` "
+                    "in `config/thresholds.json` if all your files share one currency." % (
+                        ", ".join(s["currency_mismatch"]), s["currency_code"], s["currency_code"]), ""]
     rows = []
     for label, key, kind in TOTAL_ROWS:
         if t["current"][key] is None and t["previous"][key] is None:
@@ -688,14 +757,18 @@ def jsonable(value):
     return value
 
 
-def run(paths, tags_path=None, week_ending=None, platform=None, config_dir=CONFIG_DIR):
+def run(paths, tags_path=None, week_ending=None, platform=None, config_dir=CONFIG_DIR,
+        decimal_comma=False):
     """Read the exports and return (markdown, summary)."""
     cols, th = load_config(config_dir)
-    results = [read_export(p, cols, platform) for p in paths]
+    results = [read_export(p, cols, platform, decimal_comma) for p in paths]
     rows = [row for r in results for row in r["rows"]]
     tag_table = load_tags_csv(tags_path) if tags_path else {}
     summary = analyze(rows, th, tag_table, week_ending)
     summary["data_notes"] = file_notes(results, th) + summary["data_notes"]
+    summary["currency_mismatch"] = ["%s (%s)" % (r["file"], r["currency"]) for r in results
+                                    if r["currency"] and r["currency"] != th["currency_code"]]
+    summary["currency_code"] = th["currency_code"]
     return render_markdown(summary, Fmt(th.get("currency_symbol", "$"))), jsonable(summary)
 
 
@@ -711,17 +784,21 @@ def main(argv=None):
     parser.add_argument("--tags", help="tags CSV: campaign, then one column per tag")
     parser.add_argument("--week-ending", help="last day of the current week, YYYY-MM-DD (default: latest date in the data)")
     parser.add_argument("--platform", choices=sorted(PLATFORM_NAMES), help="force the platform for all files")
-    parser.add_argument("--out", help="markdown report path (default: out/report.md)")
-    parser.add_argument("--summary", help="JSON summary path (default: out/summary.json)")
+    parser.add_argument("--out", help="markdown report path (default: ./out/report.md in the current folder)")
+    parser.add_argument("--summary", help="JSON summary path (default: summary.json next to the report)")
+    parser.add_argument("--decimal-comma", action="store_true",
+                        help="read numbers as 1.234,56 in every file (European exports)")
     parser.add_argument("--demo", action="store_true", help="run on examples/ and write examples/sample-report.md")
     args = parser.parse_args(argv)
 
     paths, tags = args.exports, args.tags
-    report_path = args.out or ROOT / "out" / "report.md"
+    report_path = Path(args.out) if args.out else Path.cwd() / "out" / "report.md"
+    summary_path = Path(args.summary) if args.summary else report_path.parent / "summary.json"
     if args.demo:
         paths = sorted(str(p) for p in (ROOT / "examples" / "exports").glob("*.csv"))
         tags = str(ROOT / "examples" / "tags.example.csv")
-        report_path = args.out or ROOT / "examples" / "sample-report.md"
+        report_path = Path(args.out) if args.out else ROOT / "examples" / "sample-report.md"
+        summary_path = Path(args.summary) if args.summary else ROOT / "out" / "summary.json"
     if not paths:
         parser.error("give at least one CSV export, or use --demo")
     week_ending = None
@@ -731,11 +808,10 @@ def main(argv=None):
         except ValueError:
             parser.error("--week-ending must look like 2026-03-15")
     try:
-        markdown, summary = run(paths, tags, week_ending, args.platform)
+        markdown, summary = run(paths, tags, week_ending, args.platform, decimal_comma=args.decimal_comma)
     except (OSError, ValueError) as error:
         print("Error: %s" % error, file=sys.stderr)
         return 1
-    summary_path = args.summary or ROOT / "out" / "summary.json"
     write_outputs(markdown, summary, report_path, summary_path)
     print(summary["look_first"])
     print("Report: %s" % report_path)
