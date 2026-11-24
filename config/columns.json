@@ -1,21 +1,26 @@
 {
-  "_comment": "Header aliases are matched after lowercasing and trimming. Add your own export headers here.",
+  "_comment": "Header aliases are matched after lowercasing and trimming. Patterns are regular expressions that must match the whole header. Currency and end-date columns are read for checks but never become metrics. Add your own export headers here.",
   "fields": {
     "date": ["date", "day", "reporting starts", "start date", "start date (in utc)"],
     "campaign": ["campaign name", "campaign"],
-    "spend": ["amount spent (usd)", "amount spent (eur)", "amount spent (gbp)", "amount spent", "cost", "total spent", "spend"],
+    "spend": ["amount spent", "cost", "total spent", "spend"],
     "impressions": ["impressions", "impr.", "impr"],
     "clicks": ["link clicks", "clicks"],
     "conversions": ["results", "conversions", "conv.", "total conversions"],
     "revenue": ["purchases conversion value", "purchase conversion value", "conv. value", "conversion value", "revenue"]
   },
+  "patterns": {
+    "spend": ["amount spent \\([a-z]{3}\\)"]
+  },
+  "currency_columns": ["currency", "currency code"],
+  "end_date_columns": ["reporting ends", "end date", "end date (in utc)"],
   "ignore": [
     "reporting ends", "end date", "end date (in utc)", "campaign id", "campaign status",
     "campaign delivery", "account name", "currency", "currency code", "ctr",
     "avg. cpc", "cost / conv.", "cost per result", "conv. rate"
   ],
   "platform_signatures": {
-    "meta": ["amount spent (usd)", "amount spent (eur)", "amount spent", "link clicks", "results", "reporting starts"],
+    "meta": ["amount spent", "link clicks", "results", "reporting starts"],
     "google": ["cost", "impr.", "conv. value", "day"],
     "linkedin": ["total spent", "start date", "start date (in utc)"]
   },

@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -107,11 +108,14 @@ class ReadingTests(unittest.TestCase):
 
     def test_dash_and_blank_cells_become_zero_and_are_counted(self):
         text = ("Day,Campaign,Cost,Impr.,Clicks,Conversions,Conv. value\n"
-                "2026-03-02,G_A_B_US,10,1000,20,--,\n")
+                "2026-03-02,G_A_B_US,10,1000,20,--,\n"
+                "2026-03-03,G_A_B_US,10,1000,20,1,50\n")
         result = self.read("g.csv", text)
         row = result["rows"][0]
         self.assertEqual((row["conversions"], row["revenue"]), (0.0, 0.0))
         self.assertEqual(result["blank_cells"]["conversions"], 1)
+        self.assertEqual(result["blank_cells"]["revenue"], 1)
+        self.assertFalse(result["revenue_blank"])
 
     def test_unreadable_number_skips_row(self):
         text = ("Day,Campaign,Cost,Impr.,Clicks\n"
@@ -121,10 +125,101 @@ class ReadingTests(unittest.TestCase):
         self.assertEqual(result["skipped"]["unreadable number"], 1)
 
     def test_unknown_columns_reported_and_platform_override(self):
-        text = "Day,Campaign,Cost,Mystery\n2026-03-02,A,10,x\n"
+        text = "Date,Campaign,Spend,Mystery\n2026-03-02,A,10,x\n"
         result = self.read("x.csv", text, platform="linkedin")
         self.assertEqual(result["unknown_columns"], ["Mystery"])
         self.assertEqual(result["platform"], "linkedin")
+        self.assertTrue(result["platform_forced"])
+        self.assertIn("(set with --platform)", report.file_notes([result], TH)[0])
+
+    def test_platform_flag_leaves_detected_files_alone(self):
+        text = "Day,Campaign,Cost,Impr.\n2026-03-02,A,10,100\n"
+        result = self.read("g.csv", text, platform="linkedin")
+        self.assertEqual(result["platform"], "google")
+        self.assertFalse(result["platform_forced"])
+
+    def test_undetected_platform_note_says_what_the_flag_changes(self):
+        result = self.read("x.csv", "Date,Campaign,Spend\n2026-03-02,A,10\n")
+        self.assertEqual(result["platform"], "unknown")
+        note = report.file_notes([result], TH)[0]
+        self.assertIn("--platform meta, google or linkedin", note)
+        self.assertIn("only changes files whose platform is not detected", note)
+
+    def test_amount_spent_with_any_currency_code(self):
+        text = ("Reporting starts,Campaign name,Amount spent (CHF),Impressions,Link clicks,Results\n"
+                "2026-03-02,A_B_C,12.50,1000,20,1\n")
+        result = self.read("m.csv", text)
+        self.assertEqual(result["rows"][0]["spend"], 12.5)
+        self.assertEqual(result["currency"], "CHF")
+        self.assertEqual(result["platform"], "meta")
+        self.assertEqual(result["unknown_columns"], [])
+
+    def test_currency_code_column_sets_currency(self):
+        text = ("Day,Campaign,Currency code,Cost,Impr.\n"
+                "2026-03-02,G_A_B_NL,EUR,12.50,800\n2026-03-03,G_A_B_NL,EUR,12.50,800\n")
+        result = self.read("g.csv", text)
+        self.assertEqual(result["currency"], "EUR")
+        self.assertEqual(result["unknown_columns"], [])
+        self.assertTrue(any("currency is EUR" in n for n in report.file_notes([result], TH)))
+
+    def test_linkedin_currency_column_is_read(self):
+        result = report.read_export(ROOT / "examples" / "exports" / "linkedin-ads.example.csv", COLS)
+        self.assertEqual(result["currency"], "USD")
+
+    def test_revenue_column_blank_in_every_row_is_missing(self):
+        text = ("Reporting starts,Reporting ends,Campaign name,Amount spent (USD),Impressions,"
+                "Link clicks,Results,Purchases conversion value\n"
+                "2026-03-02,2026-03-02,M_Leadgen_Form_US,500,40000,400,20,\n"
+                "2026-03-03,2026-03-03,M_Leadgen_Form_US,500,40000,400,20,\n")
+        result = self.read("m.csv", text)
+        self.assertTrue(result["revenue_blank"])
+        self.assertEqual([r["revenue"] for r in result["rows"]], [None, None])
+        self.assertNotIn("revenue", result["blank_cells"])
+        notes = report.file_notes([result], TH)
+        self.assertTrue(any("blank in every row" in n and "left out of ROAS" in n for n in notes))
+
+    def test_day_first_dates_are_detected(self):
+        rows = "".join("%02d/03/2026,L_A_B_NL,100,2000,20,1\n" % d for d in range(2, 16))
+        result = self.read("l.csv", "Start Date (in UTC),Campaign Name,Total Spent,Impressions,Clicks,"
+                                    "Conversions\n" + rows)
+        self.assertEqual(result["date_order"], "day")
+        self.assertEqual(len(result["rows"]), 14)
+        self.assertEqual(result["rows"][-1]["date"], date(2026, 3, 15))
+        notes = report.file_notes([result], TH)
+        self.assertTrue(any("dates read day first (13/03/2026 is March 13, 2026)" in n for n in notes))
+
+    def test_month_first_dates_need_no_note(self):
+        text = "Start Date,Campaign Name,Total Spent\n3/2/2026,A,10\n3/15/2026,A,10\n"
+        result = self.read("l.csv", text)
+        self.assertEqual(result["date_order"], "month")
+        self.assertEqual(result["rows"][1]["date"], date(2026, 3, 15))
+        self.assertFalse(any("dates" in n for n in report.file_notes([result], TH)))
+
+    def test_ambiguous_slash_dates_get_a_note(self):
+        result = self.read("l.csv", "Start Date,Campaign Name,Total Spent\n3/2/2026,A,10\n3/4/2026,A,10\n")
+        self.assertEqual(result["date_order"], "ambiguous")
+        self.assertEqual(result["rows"][0]["date"], date(2026, 3, 2))
+        notes = report.file_notes([result], TH)
+        self.assertTrue(any("3/2/2026 could be month first or day first" in n for n in notes))
+
+    def test_export_not_broken_down_by_day_stops(self):
+        text = ("Reporting starts,Reporting ends,Campaign name,Amount spent (USD),Impressions,"
+                "Link clicks,Results\n2026-03-02,2026-03-15,M_A_B_US,5000,400000,4000,100\n")
+        with self.assertRaises(report.InputError) as caught:
+            self.read("meta_agg.csv", text)
+        self.assertIn("not broken down by day", str(caught.exception))
+        self.assertIn("Breakdown > Time > Day", str(caught.exception))
+
+    def test_meta_results_column_gets_a_note(self):
+        meta = report.read_export(ROOT / "examples" / "exports" / "meta-ads.example.csv", COLS)
+        google = report.read_export(ROOT / "examples" / "exports" / "google-ads.example.csv", COLS)
+        results_notes = [n for n in report.file_notes([meta, google], TH) if "Results column" in n]
+        self.assertEqual(len(results_notes), 1)
+        self.assertTrue(results_notes[0].startswith("meta-ads.example.csv:"))
+
+    def test_one_row_is_singular(self):
+        result = self.read("g.csv", "Day,Campaign,Cost\n2026-03-02,A,10\n")
+        self.assertIn("1 row used.", report.file_notes([result], TH)[0])
 
     def test_utf16_tab_separated_export(self):
         text = "Day\tCampaign\tCost\n2026-03-02\tA\t10\n"
@@ -248,7 +343,7 @@ class TagTests(unittest.TestCase):
     def test_median_needs_three_campaigns_per_tag_value(self):
         def camp(name, cpa_conv, tag):
             return {"platform": "meta", "campaign": name, "tags": {"audience": tag},
-                    "current": stats(100.0 * 1, 10000, 100, cpa_conv)}
+                    "current": stats(100.0, 10000, 100, cpa_conv)}
         campaigns = [camp("a", 10, "Cold"), camp("b", 5, "Cold"), camp("c", 4, "Cold"),
                      camp("d", 20, "Warm"), camp("e", 25, "Warm")]
         result = report.median_comparison(campaigns, TH)
@@ -326,6 +421,165 @@ class EndToEndTests(unittest.TestCase):
 
     def test_report_has_no_fake_zero_for_missing_values(self):
         self.assertIn("| Q1_Prospecting_Document_US (LinkedIn) | $910 | 0 | n/a |", self.markdown)
+
+    def test_triggers_list_last_week_first_like_the_money(self):
+        triggers = {m["rule"]: m["trigger"] for m in self.summary["movers"]
+                    if m["campaign"] == "Q1_Prospecting_Video_US"}
+        self.assertIn("70 conversions last week and 40 this week", triggers["cpa_up"])
+        self.assertIn("210,000 impressions last week and 205,000 this week", triggers["ctr_down"])
+
+    def test_window_line_names_the_weekday(self):
+        self.assertIn("Week ending Sunday 2026-03-15. This week is Mar 9 to Mar 15", self.markdown)
+
+    def test_note_says_which_tags_came_from_names(self):
+        notes = [n for n in self.summary["data_notes"] if n.startswith("Tags read from campaign names")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("creative, objective", notes[0])
+        self.assertIn("--tags overrides them", notes[0])
+
+    def test_no_names_note_when_tags_file_covers_every_tag(self):
+        rows = [{"platform": "meta", "campaign": "Q1_Prospecting_Video_US", "date": date(2026, 3, d),
+                 "spend": 10.0, "impressions": 100.0, "clicks": 5.0, "conversions": 1.0, "revenue": None}
+                for d in range(2, 16)]
+        table = {"q1_prospecting_video_us": {"objective": "Awareness", "creative": "Reel"}}
+        summary = report.analyze(rows, TH, table)
+        self.assertFalse(any("Tags read from campaign names" in n for n in summary["data_notes"]))
+
+
+def google_rows(days, campaign="G_Brand_Text_US", spend=100):
+    return "".join("2026-03-%02d,%s,%s,2000,200,10,1000\n" % (d, campaign, spend) for d in days)
+
+
+GOOGLE_HEADER = "Day,Campaign,Cost,Impr.,Clicks,Conversions,Conv. value\n"
+LINKEDIN_HEADER = "Start Date,Campaign Name,Total Spent,Impressions,Clicks,Conversions\n"
+
+
+class CoverageTests(unittest.TestCase):
+    """Each export is checked for rows in both weeks, so one short export can't skew the rest."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.demo = {p.name.split("-")[0]: str(p) for p in (ROOT / "examples" / "exports").glob("*.csv")}
+
+    def file(self, name, text):
+        return str(write(self.tmp.name, name, text))
+
+    def test_export_with_one_week_is_left_out_of_totals_and_new_flags(self):
+        li = self.file("li_7days.csv", LINKEDIN_HEADER + "".join(
+            "3/%d/2026,L_Prospecting_Document_US,200,5000,50,0\n" % d for d in range(9, 16)))
+        markdown, summary = report.run([self.demo["meta"], self.demo["google"], li])
+        self.assertFalse([m for m in summary["movers"] if m["platform"] == "linkedin" and m["rule"] == "new"])
+        zero = [m for m in summary["movers"] if m["rule"] == "zero_conversions"][0]
+        self.assertIn("no data for last week to compare", zero["why_it_matters"])
+        self.assertAlmostEqual(summary["totals"]["current"]["spend"], 5119.0 + 3080.0, places=2)
+        self.assertEqual(summary["totals"]["left_out"], ["linkedin"])
+        linkedin = [p for p in summary["platforms"] if p["platform"] == "linkedin"][0]
+        self.assertFalse(linkedin["compared"])
+        self.assertIsNone(linkedin["change"]["spend"])
+        self.assertIn("LinkedIn Ads is left out of the totals and the week-over-week changes", markdown)
+        self.assertTrue(any(n.startswith("li_7days.csv: no data for last week") for n in summary["data_notes"]))
+
+    def test_export_without_this_week_gives_no_stopped_flags(self):
+        google = self.file("g.csv", GOOGLE_HEADER + google_rows(range(2, 16)))
+        li = self.file("li_old.csv", LINKEDIN_HEADER + "".join(
+            "3/%d/2026,L_Prospecting_Document_US,200,5000,50,1\n" % d for d in range(2, 9)))
+        _, summary = report.run([google, li])
+        self.assertFalse([m for m in summary["movers"] if m["rule"] == "stopped"])
+        self.assertEqual(summary["totals"]["platforms"], ["google"])
+        self.assertTrue(any(n.startswith("li_old.csv: no data for this week") for n in summary["data_notes"]))
+
+    def test_no_previous_week_shows_last_week_as_na(self):
+        markdown, summary = report.run([self.file("one.csv", GOOGLE_HEADER + google_rows(range(9, 16), spend=500))])
+        self.assertIsNone(summary["totals"]["previous"]["spend"])
+        self.assertIn("| Spend | $3,500 | n/a | n/a |", markdown)
+        self.assertEqual(summary["movers"], [])
+
+    def test_blank_revenue_file_is_left_out_of_roas(self):
+        meta = self.file("meta_leads.csv", "Reporting starts,Reporting ends,Campaign name,Amount spent (USD),"
+                         "Impressions,Link clicks,Results,Purchases conversion value\n" + "".join(
+                             "2026-03-%02d,2026-03-%02d,M_Leadgen_Form_US,500,40000,400,20,\n" % (d, d)
+                             for d in range(2, 16)))
+        google = self.file("g.csv", GOOGLE_HEADER + google_rows(range(2, 16)))
+        markdown, summary = report.run([meta, google])
+        self.assertAlmostEqual(summary["totals"]["current"]["roas"], 10.0)
+        meta_row = [p for p in summary["platforms"] if p["platform"] == "meta"][0]
+        self.assertIsNone(meta_row["current"]["roas"])
+        self.assertIn("Revenue and ROAS leave out Meta Ads, which has no revenue data in its export.", markdown)
+
+    def run_cli(self, *args):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = report.main(list(args) + ["--out", str(Path(self.tmp.name) / "r.md")])
+        return code, err.getvalue()
+
+    def test_week_ending_after_the_data_exits_2(self):
+        code, err = self.run_cli(*sorted(self.demo.values()), "--week-ending", "2026-03-22")
+        self.assertEqual(code, 2)
+        self.assertEqual(len(err.strip().splitlines()), 1)
+        self.assertIn("after the last date in the exports (2026-03-15)", err)
+        self.assertFalse((Path(self.tmp.name) / "r.md").exists())
+
+    def test_week_ending_before_the_data_exits_2(self):
+        code, err = self.run_cli(*sorted(self.demo.values()), "--week-ending", "2026-02-01")
+        self.assertEqual(code, 2)
+        self.assertIn("no rows fall in the week ending 2026-02-01", err)
+
+    def test_export_not_by_day_exits_2(self):
+        meta = self.file("meta_agg.csv", "Reporting starts,Reporting ends,Campaign name,Amount spent (USD)\n"
+                                         "2026-03-02,2026-03-15,M_A_B_US,5000\n")
+        code, err = self.run_cli(meta)
+        self.assertEqual(code, 2)
+        self.assertIn("meta_agg.csv is not broken down by day", err)
+
+
+class DuplicateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.paths = sorted(str(p) for p in (ROOT / "examples" / "exports").glob("*.csv"))
+
+    def test_second_download_of_an_export_is_dropped(self):
+        meta = ROOT / "examples" / "exports" / "meta-ads.example.csv"
+        copy = Path(self.tmp.name) / "meta-ads (1).csv"
+        copy.write_bytes(meta.read_bytes())
+        _, summary = report.run(self.paths + [str(copy)])
+        self.assertEqual(summary["totals"]["current"]["spend"], 9409.0)
+        self.assertEqual(summary["totals"]["previous"]["conversions"], 285.5)
+        self.assertIn("meta-ads (1).csv: read as Meta Ads, 0 rows used.", summary["data_notes"])
+        self.assertTrue(any(n.startswith("meta-ads (1).csv: 70 rows were exact copies of rows in "
+                                         "meta-ads.example.csv") for n in summary["data_notes"]))
+
+    def test_same_campaign_day_with_different_numbers_is_kept_with_a_warning(self):
+        a = write(self.tmp.name, "a.csv", GOOGLE_HEADER + google_rows(range(2, 16)))
+        b = write(self.tmp.name, "b.csv", GOOGLE_HEADER + google_rows([9], spend=150))
+        _, summary = report.run([str(a), str(b)])
+        self.assertEqual(summary["totals"]["current"]["spend"], 850.0)
+        warning = summary["data_notes"][0]
+        self.assertTrue(warning.startswith("Check this: 1 campaign-day appears more than once"))
+        self.assertIn("G_Brand_Text_US (Google) on 2026-03-09 in a.csv and b.csv", warning)
+
+
+class FormatTests(unittest.TestCase):
+    def test_negative_money_puts_the_sign_first(self):
+        self.assertEqual(FMT.money(-5), "-$5")
+        self.assertEqual(FMT.money(-1234.5, 2), "-$1,234.50")
+        self.assertEqual(FMT.money(-0.4), "$0")
+        self.assertEqual(FMT.money(5), "$5")
+
+    def test_currency_warning_grammar_with_two_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            header = "Day,Campaign,Currency code,Cost\n"
+            body = "".join("2026-03-%02d,G_A_B_NL,EUR,10\n" % d for d in range(2, 16))
+            paths = [str(write(tmp, name, header + body.replace("G_A_B_NL", name[0])))
+                     for name in ("a.csv", "b.csv")]
+            markdown, _ = report.run(paths)
+        self.assertIn("Check the currency first: a.csv (EUR) and b.csv (EUR) use a different currency "
+                      "than USD.", markdown)
+
+    def test_source_has_no_literal_invisible_characters(self):
+        source = (ROOT / "scripts" / "report.py").read_text(encoding="utf-8")
+        self.assertNotIn("\ufeff", source)
 
 
 class NumberFormatTests(unittest.TestCase):
@@ -418,6 +672,101 @@ class WorkingFolderTests(unittest.TestCase):
         self.assertTrue((self.work / "summary.json").exists())
         self.assertFalse((self.work / "out").exists())
         self.assert_repo_untouched()
+
+    def test_tags_file_is_only_read_with_the_flag(self):
+        done = self.run_cli(self.work, "exports/meta-ads.example.csv")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        summary = json.loads((self.work / "out" / "summary.json").read_text(encoding="utf-8"))
+        self.assertFalse([c for c in summary["campaigns"] if "audience" in c["tags"]])
+        done = self.run_cli(self.work, "exports/meta-ads.example.csv", "--tags", "tags.csv")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        summary = json.loads((self.work / "out" / "summary.json").read_text(encoding="utf-8"))
+        self.assertTrue([c for c in summary["campaigns"] if "audience" in c["tags"]])
+
+
+def read_text(*parts):
+    return ROOT.joinpath(*parts).read_text(encoding="utf-8")
+
+
+def code_blocks(text, lang):
+    """The contents of every fenced block with this language tag ('' for none)."""
+    blocks, current, current_lang = [], None, None
+    for line in text.splitlines(keepends=True):
+        fence = line.strip()
+        if fence.startswith("```"):
+            if current is None:
+                current, current_lang = [], fence[3:]
+            else:
+                if current_lang == lang:
+                    blocks.append("".join(current))
+                current = None
+            continue
+        if current is not None:
+            current.append(line)
+    return blocks
+
+
+class DocsTests(unittest.TestCase):
+    """The README and SKILL.md are public. These keep them true to the code."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.readme, cls.skill = read_text("README.md"), read_text("SKILL.md")
+        cls.sample, cls.summary_text = read_text("examples", "sample-report.md"), \
+            read_text("examples", "sample-summary.md")
+
+    def test_readme_run_uses_default_output_and_outputs_are_ignored(self):
+        runs = [line for line in self.readme.splitlines() if "scripts/report.py exports/" in line]
+        self.assertTrue(runs)
+        self.assertFalse([line for line in runs if "--out" in line])
+        self.assertIn("out/report.md", self.readme)
+        self.assertIn("out/summary.json", self.readme)
+        ignored = read_text(".gitignore").splitlines()
+        for entry in ("out/", "/exports/", "/report.md", "/summary.json"):
+            self.assertIn(entry, ignored)
+
+    def test_readme_tags_step_passes_the_flag(self):
+        self.assertIn("python3 scripts/report.py exports/*.csv --tags tags.csv", self.readme)
+
+    def test_readme_excerpt_is_a_faithful_part_of_the_sample(self):
+        self.assertIn("](examples/sample-report.md)", self.readme)
+        excerpt = [b for b in code_blocks(self.readme, "text") if b.startswith("Look at this first")][0]
+        self.assertIn(excerpt, self.sample)
+        self.assertIn("| --- | ---: | ---: | ---: |", excerpt)
+
+    def test_readme_shows_the_start_of_the_sample_summary(self):
+        self.assertIn("](examples/sample-summary.md)", self.readme)
+        first = self.summary_text.splitlines()[0]
+        self.assertTrue([b for b in code_blocks(self.readme, "text") if b.startswith(first)])
+
+    def test_sample_summary_follows_the_skill_rules(self):
+        text = self.summary_text
+        self.assertLessEqual(len(text.split()), 200)
+        self.assertEqual(text.count("Recommendation:"), 1)
+        self.assertIn("doesn't show why", text)
+        self.assertNotIn("\u2014", text)
+        self.assertTrue(text.startswith("Data notes"))
+        numbers = re.findall(r"(?<![\w.])[-+]?\$?\d[\d,]*(?:\.\d+)?[%x]?", text)
+        self.assertTrue(numbers)
+        for number in numbers:
+            self.assertIn(number.rstrip(","), self.sample)
+
+    def test_skill_command_uses_placeholders_and_stops_on_errors(self):
+        self.assertNotIn("--week-ending 2026-03-15", self.skill)
+        self.assertIn("--week-ending <YYYY-MM-DD>", self.skill)
+        self.assertIn("exit code", self.skill)
+        self.assertIn("Results", self.skill)
+        self.assertIn("70 conversions last week and 40 this week", self.skill)
+
+    def test_readme_files_list_is_complete_and_test_count_is_current(self):
+        files = [b for b in code_blocks(self.readme, "") if b.startswith("SKILL.md")][0]
+        listed = [line.split()[0] for line in files.splitlines() if line.strip()]
+        for path in listed:
+            self.assertTrue((ROOT / path).exists(), path)
+        for path in ("examples/tags.example.csv", "examples/sample-summary.md"):
+            self.assertIn(path, listed)
+        count = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]).countTestCases()
+        self.assertEqual(int(re.search(r"tests/test_report.py\s+(\d+) offline tests", files).group(1)), count)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ Look at this first: Q1_Prospecting_Video_US (Meta), cost per conversion went fro
 
 # Weekly campaign report
 
-Week ending 2026-03-15. This week is Mar 9 to Mar 15, compared with Mar 2 to Mar 8. Every figure comes from the exports you supplied.
+Week ending Sunday 2026-03-15. This week is Mar 9 to Mar 15, compared with Mar 2 to Mar 8. Every figure comes from the exports you supplied.
 
 ## Totals
 
@@ -19,7 +19,7 @@ Week ending 2026-03-15. This week is Mar 9 to Mar 15, compared with Mar 2 to Mar
 | ROAS | 3.01x | 3.59x | -16.1% |
 
 Conversions are counted by each platform's own rules, so treat the totals as a sum of platform numbers.
-Revenue and ROAS leave out LinkedIn Ads, which has no revenue column in its export.
+Revenue and ROAS leave out LinkedIn Ads, which has no revenue data in its export.
 
 ## By platform
 
@@ -32,13 +32,13 @@ Revenue and ROAS leave out LinkedIn Ads, which has no revenue column in its expo
 ## Movers
 
 - **Q1_Prospecting_Video_US** (Meta): cost per conversion went from $30.00 to $60.00 (+100.0%).
-  - Triggered by: CPA +100.0% (flag at +25%); 40 and 70 conversions (minimum 10 each week).
+  - Triggered by: CPA +100.0% (flag at +25%); 70 conversions last week and 40 this week (minimum 10 each week).
   - Why it matters: At this week's 40 conversions, the higher rate costs about $1,200 more than last week's rate would have. The export does not show why.
 - **Q1_Prospecting_Document_US** (LinkedIn): $910 spent with no conversions.
   - Triggered by: 0 conversions on $910 spend (flag at $250 or more).
   - Why it matters: Last week: 2 conversions on $840. The export does not show why.
 - **Q1_Prospecting_Video_US** (Meta): click-through rate fell from 1.50% to 1.17% (-22.0%).
-  - Triggered by: CTR -22.0% (flag at -20%); impressions 205,000 and 210,000 (minimum 10,000 each week).
+  - Triggered by: CTR -22.0% (flag at -20%); 210,000 impressions last week and 205,000 this week (minimum 10,000 each week).
   - Why it matters: Fewer clicks per impression this week. The export does not show why.
 - **Q1_Prospecting_Shopping_US** (Google): new campaign, $900 spent on 5 of 7 days.
   - Triggered by: No spend last week; spend this week is $900 (flag at $100 or more).
@@ -86,8 +86,10 @@ Metric: CPA for this week. Overall median across 10 campaigns: $34.38. Lower is 
 - meta-ads.example.csv: read as Meta Ads, 70 rows used.
 - meta-ads.example.csv: unknown columns ignored: Frequency.
 - meta-ads.example.csv: blank or '--' cells read as 0 in conversions (11), revenue (11).
+- meta-ads.example.csv: conversions come from Meta's Results column, which counts whatever each campaign optimizes for (purchases, leads, link clicks). Check that the campaigns you compare count the same result.
 - Currency: all amounts are treated as USD. The tool does not convert currencies.
 - Each platform counts conversions and revenue by its own rules, so the same customer can appear in more than one platform. Read the totals as a sum of platform numbers, not as unique conversions.
 - Not enough campaigns to compare (need 3 with enough volume; counted of total in brackets): audience=Brand (1 of 1), creative=Carousel (0 of 1), creative=Display (1 of 1), creative=Document (0 of 1), creative=Lead (1 of 1), creative=Shopping (1 of 1), creative=Static (2 of 2), creative=Video (2 of 2), objective=Brand (1 of 1), objective=Test (0 of 1).
+- Tags read from campaign names: creative, objective (split on '_', set by tags_from_names in config/thresholds.json). A tags file passed with --tags overrides them.
 - No 'audience' tag for: Q1_Test_Carousel_US.
 - No 'offer' tag for: Q1_Test_Carousel_US.

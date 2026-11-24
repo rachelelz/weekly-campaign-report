@@ -11,6 +11,10 @@ library only.
 
 Relative paths (exports, --tags, --out) resolve against the folder you run
 the command from. Only --demo reads and writes inside the tool's own folder.
+
+Exit codes: 0 when the report is written, 1 when a file can't be read or has
+no usable rows, 2 when the options or exports can't give an honest report
+(the one-line message says what to change).
 """
 import argparse
 import csv
@@ -27,10 +31,19 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = ROOT / "config"
 NA = "n/a"
 METRICS = ("spend", "impressions", "clicks", "conversions", "revenue")
+DERIVED = ("ctr", "cpc", "cpa", "roas")
 REQUIRED_FIELDS = {"date", "campaign", "spend"}
 PLACEHOLDERS = {"", "--", "---", "-", "\u2014", "\u2013", "n/a", "na", "null", "none"}
 PLATFORM_NAMES = {"meta": "Meta Ads", "google": "Google Ads", "linkedin": "LinkedIn Ads"}
 SHORT_PLATFORM = {"meta": "Meta", "google": "Google", "linkedin": "LinkedIn"}
+WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+DAILY_EXPORT_HINTS = {"meta": "in Meta Ads Manager: Breakdown > Time > Day",
+                      "google": "in Google Ads: Segment > Time > Day",
+                      "linkedin": "in LinkedIn Campaign Manager: the daily time breakdown"}
+
+
+class InputError(Exception):
+    """The options or exports can't give an honest report. The command line exits with 2."""
 
 
 # ---------------------------------------------------------------- parsing
@@ -38,6 +51,7 @@ SHORT_PLATFORM = {"meta": "Meta", "google": "Google", "linkedin": "LinkedIn"}
 COMMA_DECIMAL = re.compile(r"\d,\d{1,2}$|\d{1,3}(\.\d{3})+,\d+$")
 DOT_DECIMAL = re.compile(r"\d\.\d{1,2}$|\d{1,3}(,\d{3})+\.\d+$")
 GROUPED_ONLY = re.compile(r"\d{1,3}([,.]\d{3})+$")
+SLASH_DATE = re.compile(r"\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$")
 CURRENCY_SYMBOLS = {"\u20ac": "EUR", "\u00a3": "GBP", "$": "USD"}
 
 
@@ -64,6 +78,25 @@ def detect_number_style(cells):
     if comma or grouped and not dot:
         return "ambiguous"
     return "us"
+
+
+def detect_date_order(cells):
+    """Decide how one file writes dates like 03/04/2026. Returns (order, example cell).
+    Any first number above 12 (15/03/2026) means 'day' first. Otherwise any second
+    number above 12 (3/15/2026) means 'month' first. Slash dates with neither are
+    'ambiguous' and read month first. order is None when the file has no slash dates."""
+    order, example = None, None
+    for cell in cells:
+        match = SLASH_DATE.match(cell or "")
+        if not match:
+            continue
+        if int(match.group(1)) > 12:
+            return "day", cell.strip()
+        if int(match.group(2)) > 12:
+            order, example = "month", cell.strip()
+        elif order is None:
+            order, example = "ambiguous", cell.strip()
+    return order, example
 
 
 def parse_number(text, decimal_comma=False):
@@ -102,7 +135,7 @@ def parse_date(text, formats):
 
 
 def normalize_header(text):
-    return " ".join(text.replace("﻿", "").strip().lower().split())
+    return " ".join(text.replace("\ufeff", "").strip().lower().split())
 
 
 def pct_change(current, previous):
@@ -135,6 +168,16 @@ def decode_bytes(raw):
     return raw.decode("utf-8-sig", errors="replace")
 
 
+def match_field(key, lookup, cols):
+    """The field a normalized header belongs to, from the aliases or the patterns."""
+    if key in lookup:
+        return lookup[key]
+    for field, patterns in cols.get("patterns", {}).items():
+        if any(re.fullmatch(p, key) for p in patterns):
+            return field
+    return None
+
+
 def map_headers(header, cols):
     """Match a header row to our fields. Returns (field -> column index, unknown headers)."""
     lookup = {a: field for field, aliases in cols["fields"].items() for a in aliases}
@@ -142,9 +185,10 @@ def map_headers(header, cols):
     mapping, unknown = {}, []
     for index, cell in enumerate(header):
         key = normalize_header(cell)
-        if key in lookup and lookup[key] not in mapping:
-            mapping[lookup[key]] = index
-        elif key and key not in ignore and key not in lookup:
+        field = match_field(key, lookup, cols)
+        if field and field not in mapping:
+            mapping[field] = index
+        elif key and not field and key not in ignore:
             unknown.append(cell.strip())
     return mapping, unknown
 
@@ -159,19 +203,35 @@ def find_header(table, cols):
 
 
 def detect_platform(header, cols):
-    cells = {normalize_header(c) for c in header}
+    cells = set()
+    for cell in header:
+        key = normalize_header(cell)
+        cells.add(key)
+        cells.add(re.sub(r"\s*\([a-z]{3}\)$", "", key))  # "amount spent (chf)" counts as "amount spent"
     scores = {p: len(cells & set(sigs)) for p, sigs in cols["platform_signatures"].items()}
     best = max(scores, key=lambda p: scores[p])
     return best if scores[best] > 0 else "unknown"
 
 
+def column_index(keys, names):
+    names = set(names)
+    return next((i for i, key in enumerate(keys) if key in names), None)
+
+
+def long_date(day):
+    return "%s %d, %d" % (day.strftime("%B"), day.day, day.year)
+
+
 def read_export(path, cols, platform=None, decimal_comma=False):
-    """Read one CSV export. Returns a dict with rows and notes about what was skipped."""
+    """Read one CSV export. Returns a dict with rows and notes about what was skipped.
+    platform names the platform only when it can't be detected from the header.
+    Raises InputError when the export is not broken down by day."""
     path = Path(path)
-    result = {"file": path.name, "rows": [], "platform": None, "preamble_lines": 0,
-              "unknown_columns": [], "skipped": Counter(), "blank_cells": Counter(),
+    result = {"file": path.name, "rows": [], "platform": None, "platform_forced": False,
+              "preamble_lines": 0, "unknown_columns": [], "skipped": Counter(), "blank_cells": Counter(),
               "currency": None, "number_style": "us", "forced_decimal_comma": False,
-              "error": None}
+              "date_order": None, "date_example": None, "conversions_column": None,
+              "revenue_blank": False, "duplicates": 0, "duplicate_of": [], "error": None}
     text = decode_bytes(path.read_bytes())
     found = None
     for delimiter in (",", "\t", ";"):
@@ -184,18 +244,31 @@ def read_export(path, cols, platform=None, decimal_comma=False):
         return result
     start, mapping, unknown = found
     header = table[start]
+    keys = [normalize_header(c) for c in header]
     result["preamble_lines"] = start
     result["unknown_columns"] = unknown
-    result["platform"] = platform or detect_platform(header, cols)
+    detected = detect_platform(header, cols)
+    if detected == "unknown" and platform:
+        detected, result["platform_forced"] = platform, True
+    result["platform"] = detected
+    if "conversions" in mapping:
+        result["conversions_column"] = header[mapping["conversions"]].strip()
     match = re.search(r"\(([A-Za-z]{3})\)", header[mapping["spend"]])
     result["currency"] = match.group(1).upper() if match else None
 
+    body = [cells + [""] * (len(header) - len(cells)) for cells in table[start + 1:]
+            if any(c.strip() for c in cells)]
+    order, example = detect_date_order(cells[mapping["date"]] for cells in body)
+    result["date_order"], result["date_example"] = order, example
+    formats = list(cols["date_formats"])
+    if order == "day":
+        formats = [f for f in formats if f != "%m/%d/%Y"] + ["%d/%m/%Y"]
+    end_index = column_index(keys, cols.get("end_date_columns", []))
+    currency_index = column_index(keys, cols.get("currency_columns", []))
+
     data = []
-    for cells in table[start + 1:]:
-        if not any(c.strip() for c in cells):
-            continue
-        cells = cells + [""] * (len(header) - len(cells))
-        day = parse_date(cells[mapping["date"]], cols["date_formats"])
+    for cells in body:
+        day = parse_date(cells[mapping["date"]], formats)
         name = cells[mapping["campaign"]].strip()
         if day is None:
             result["skipped"]["no valid date (total rows, footers)"] += 1
@@ -203,6 +276,15 @@ def read_export(path, cols, platform=None, decimal_comma=False):
         if not name or name == "--":
             result["skipped"]["no campaign name"] += 1
             continue
+        if end_index is not None:
+            last = parse_date(cells[end_index], formats)
+            if last is not None and last != day:
+                hint = DAILY_EXPORT_HINTS.get(result["platform"])
+                raise InputError(
+                    "%s is not broken down by day: a row for %s runs from %s to %s. Export it again "
+                    "with one row per campaign per day%s." % (
+                        result["file"], name, day.isoformat(), last.isoformat(),
+                        " (%s)" % hint if hint else ""))
         data.append((cells, day, name))
 
     fields = [f for f in METRICS if f in mapping]
@@ -212,6 +294,11 @@ def read_export(path, cols, platform=None, decimal_comma=False):
     else:
         style = detect_number_style(cells[mapping[f]] for cells, _, _ in data for f in fields)
     result["number_style"] = style
+    if not result["currency"] and currency_index is not None:
+        codes = sorted({cells[currency_index].strip().upper() for cells, _, _ in data
+                        if re.fullmatch(r"[A-Za-z]{3}", cells[currency_index].strip())})
+        if codes:
+            result["currency"] = "/".join(codes)
     if not result["currency"]:
         symbols = {CURRENCY_SYMBOLS[ch] for cells, _, _ in data
                    for ch in cells[mapping["spend"]] if ch in CURRENCY_SYMBOLS}
@@ -219,7 +306,8 @@ def read_export(path, cols, platform=None, decimal_comma=False):
             result["currency"] = symbols.pop()
 
     for cells, day, name in data:
-        row = {"platform": result["platform"], "campaign": name, "date": day}
+        row = {"platform": result["platform"], "campaign": name, "date": day, "file": result["file"]}
+        blanks = []
         try:
             for field in METRICS:
                 if field not in mapping:
@@ -227,14 +315,53 @@ def read_export(path, cols, platform=None, decimal_comma=False):
                     continue
                 value = parse_number(cells[mapping[field]], style == "comma")
                 if value is None:
-                    result["blank_cells"][field] += 1
+                    blanks.append(field)
                     value = 0.0
                 row[field] = value
         except ValueError:
             result["skipped"]["unreadable number"] += 1
             continue
+        result["blank_cells"].update(blanks)
         result["rows"].append(row)
+
+    # A revenue column with nothing in it (a lead-gen account, say) is missing, not zero.
+    if result["rows"] and "revenue" in mapping and result["blank_cells"]["revenue"] == len(result["rows"]):
+        for row in result["rows"]:
+            row["revenue"] = None
+        del result["blank_cells"]["revenue"]
+        result["revenue_blank"] = True
     return result
+
+
+def drop_duplicates(results):
+    """Drop rows that repeat an earlier row exactly (same platform, campaign, date and
+    numbers), for example from a second download of the same export. Rows for the same
+    campaign and day with different numbers are kept. Returns a warning note for those."""
+    seen, sources = {}, {}
+    for r in results:
+        kept = []
+        for row in r["rows"]:
+            day_key = (row["platform"], row["campaign"], row["date"])
+            full_key = day_key + tuple(row[m] for m in METRICS)
+            if full_key in seen:
+                r["duplicates"] += 1
+                if seen[full_key] not in r["duplicate_of"]:
+                    r["duplicate_of"].append(seen[full_key])
+                continue
+            seen[full_key] = r["file"]
+            sources.setdefault(day_key, []).append(r["file"])
+            kept.append(row)
+        r["rows"] = kept
+    clashes = sorted(key for key, files in sources.items() if len(files) > 1)
+    if not clashes:
+        return []
+    platform, campaign, day = clashes[0]
+    return ["Check this: %s more than once with different numbers, for example %s (%s) on %s in %s. "
+            "Those rows were added together. That is right when an export splits each day, for "
+            "example by device. If two exports overlap, remove one and run again." % (
+                "1 campaign-day appears" if len(clashes) == 1 else "%d campaign-days appear" % len(clashes),
+                campaign, SHORT_PLATFORM.get(platform, platform), day.isoformat(),
+                join_list(sorted(set(sources[clashes[0]]))))]
 
 
 def load_tags_csv(path):
@@ -255,13 +382,19 @@ def load_tags_csv(path):
     return table
 
 
-def tags_for(name, tag_table, naming):
-    """Tags from the naming convention first, then tags.csv on top."""
+def name_tags(name, naming):
+    """Tags read from the campaign name with the naming convention in thresholds.json."""
     tags = {}
     parts = [p.strip() for p in name.split(naming.get("delimiter", "_"))]
     for tag, position in naming.get("positions", {}).items():
         if position < len(parts) and parts[position]:
             tags[tag] = parts[position]
+    return tags
+
+
+def tags_for(name, tag_table, naming):
+    """Tags from the naming convention first, then tags.csv on top."""
+    tags = name_tags(name, naming)
     tags.update(tag_table.get(name.lower(), {}))
     return tags
 
@@ -307,6 +440,20 @@ def derive(agg):
     return out
 
 
+def unknown_week():
+    """A week the exports don't cover: every value is None, so it shows as n/a, not 0."""
+    out = {k: None for k in METRICS + DERIVED}
+    out["days_active"] = 0
+    return out
+
+
+def total(rows):
+    agg = new_agg()
+    for row in rows:
+        add_row(agg, row)
+    return derive(agg)
+
+
 def group(rows, key_fn):
     groups = {}
     for row in rows:
@@ -315,8 +462,7 @@ def group(rows, key_fn):
 
 
 def changes(current, previous):
-    return {k: pct_change(current[k], previous[k])
-            for k in (*METRICS, "ctr", "cpc", "cpa", "roas")}
+    return {k: pct_change(current[k], previous[k]) for k in METRICS + DERIVED}
 
 
 # --------------------------------------------------------------- formats
@@ -326,7 +472,11 @@ class Fmt:
         self.symbol = symbol
 
     def money(self, v, dp=0):
-        return NA if v is None else "{}{:,.{}f}".format(self.symbol, v, dp)
+        if v is None:
+            return NA
+        text = "{:,.{}f}".format(abs(v), dp)
+        sign = "-" if v < 0 and text.strip("0.,") else ""
+        return sign + self.symbol + text
 
     def count(self, v):
         if v is None:
@@ -350,6 +500,18 @@ class Fmt:
         return getattr(self, kind)(v)
 
 
+def join_list(items):
+    """'a', 'a and b', 'a, b and c'."""
+    items = list(items)
+    if len(items) < 2:
+        return "".join(items)
+    return "%s and %s" % (", ".join(items[:-1]), items[-1])
+
+
+def plural(count, one, many):
+    return "%d %s" % (count, one if count == 1 else many)
+
+
 def day_label(day):
     return "%s %d" % (day.strftime("%b"), day.day)
 
@@ -365,6 +527,8 @@ def pretty_platform(platform):
 # ---------------------------------------------------------------- movers
 # Each rule returns a flag with the numbers that triggered it. "impact" is a
 # rough dollar figure used only to rank flags (see pick_look_first).
+# A week the exports don't cover has spend None, so it never counts as a new
+# or stopped campaign.
 
 def make_flag(rule, name, platform, impact, headline, trigger, why):
     return {"rule": rule, "campaign": name, "platform": platform, "impact": round(impact, 2),
@@ -372,26 +536,30 @@ def make_flag(rule, name, platform, impact, headline, trigger, why):
 
 
 def campaign_flags(name, platform, cur, prev, th, f):
-    """Apply the threshold rules to one campaign. cur and prev come from derive()."""
+    """Apply the threshold rules to one campaign. cur and prev come from derive() or unknown_week()."""
     flags = []
     ch = changes(cur, prev)
     args = (name, platform)
     not_why = " The export does not show why."
+    cur_spend, prev_spend = cur["spend"] or 0.0, prev["spend"] or 0.0
 
-    if (cur["conversions"] == 0 and cur["spend"] >= th["zero_conversions_min_spend"]):
+    if cur["conversions"] == 0 and cur_spend >= th["zero_conversions_min_spend"]:
+        if prev["spend"] is None:
+            last = "There is no data for last week to compare."
+        else:
+            last = "Last week: %s conversions on %s." % (f.count(prev["conversions"]), f.money(prev["spend"]))
         flags.append(make_flag(
-            "zero_conversions", *args, cur["spend"],
-            "%s spent with no conversions" % f.money(cur["spend"]),
+            "zero_conversions", *args, cur_spend,
+            "%s spent with no conversions" % f.money(cur_spend),
             "0 conversions on %s spend (flag at %s or more)." % (
-                f.money(cur["spend"]), f.money(th["zero_conversions_min_spend"])),
-            "Last week: %s conversions on %s.%s" % (
-                f.count(prev["conversions"]), f.money(prev["spend"]), not_why)))
+                f.money(cur_spend), f.money(th["zero_conversions_min_spend"])),
+            last + not_why))
 
     both_conv = (cur["conversions"] or 0) >= th["cpa_min_conversions"] and \
                 (prev["conversions"] or 0) >= th["cpa_min_conversions"]
     if both_conv and ch["cpa"] is not None:
-        counts = "%s and %s conversions (minimum %d each week)" % (
-            f.count(cur["conversions"]), f.count(prev["conversions"]), th["cpa_min_conversions"])
+        counts = "%s conversions last week and %s this week (minimum %d each week)" % (
+            f.count(prev["conversions"]), f.count(cur["conversions"]), th["cpa_min_conversions"])
         extra = (cur["cpa"] - prev["cpa"]) * cur["conversions"]
         move = "cost per conversion went from %s to %s (%s)" % (
             f.money(prev["cpa"], 2), f.money(cur["cpa"], 2), f.change(ch["cpa"]))
@@ -408,13 +576,13 @@ def campaign_flags(name, platform, cur, prev, th, f):
                 "At this week's %s conversions, the lower rate saves about %s against last "
                 "week's rate." % (f.count(cur["conversions"]), f.money(-extra))))
 
-    if prev["spend"] >= th["spend_up_min_prior_spend"] and ch["spend"] is not None \
+    if prev_spend >= th["spend_up_min_prior_spend"] and ch["spend"] is not None \
             and ch["spend"] * 100 >= th["spend_up_pct"]:
-        delta = cur["spend"] - prev["spend"]
+        delta = cur_spend - prev_spend
         flags.append(make_flag(
             "spend_up", *args, delta,
             "spend rose from %s to %s (%s)" % (
-                f.money(prev["spend"]), f.money(cur["spend"]), f.change(ch["spend"])),
+                f.money(prev_spend), f.money(cur_spend), f.change(ch["spend"])),
             "Spend %s (flag at +%d%%); last week's spend was at least %s." % (
                 f.change(ch["spend"]), th["spend_up_pct"], f.money(th["spend_up_min_prior_spend"])),
             "%s more went into this campaign than last week." % f.money(delta)))
@@ -426,26 +594,26 @@ def campaign_flags(name, platform, cur, prev, th, f):
             "ctr_down", *args, 0.0,
             "click-through rate fell from %s to %s (%s)" % (
                 f.rate(prev["ctr"]), f.rate(cur["ctr"]), f.change(ch["ctr"])),
-            "CTR %s (flag at -%d%%); impressions %s and %s (minimum %s each week)." % (
-                f.change(ch["ctr"]), th["ctr_down_pct"], f.count(cur["impressions"]),
-                f.count(prev["impressions"]), f.count(th["ctr_min_impressions"])),
+            "CTR %s (flag at -%d%%); %s impressions last week and %s this week (minimum %s each "
+            "week)." % (f.change(ch["ctr"]), th["ctr_down_pct"], f.count(prev["impressions"]),
+                        f.count(cur["impressions"]), f.count(th["ctr_min_impressions"])),
             "Fewer clicks per impression this week.%s" % not_why))
 
     min_spend = th["new_or_stopped_min_spend"]
-    if prev["spend"] == 0 and cur["spend"] >= min_spend:
+    if prev["spend"] == 0 and cur_spend >= min_spend:
         flags.append(make_flag(
             "new", *args, 0.0,
-            "new campaign, %s spent on %d of 7 days" % (f.money(cur["spend"]), cur["days_active"]),
+            "new campaign, %s spent on %d of 7 days" % (f.money(cur_spend), cur["days_active"]),
             "No spend last week; spend this week is %s (flag at %s or more)." % (
-                f.money(cur["spend"]), f.money(min_spend)),
+                f.money(cur_spend), f.money(min_spend)),
             "There is no earlier week to compare. So far: %s conversions at a CPA of %s. "
             "Judge it after a full week." % (f.count(cur["conversions"]), f.money(cur["cpa"], 2))))
-    if cur["spend"] == 0 and prev["spend"] >= min_spend:
+    if cur["spend"] == 0 and prev_spend >= min_spend:
         flags.append(make_flag(
             "stopped", *args, 0.0,
-            "no spend this week after %s last week" % f.money(prev["spend"]),
+            "no spend this week after %s last week" % f.money(prev_spend),
             "Spend %s this week; last week %s (flag at %s or more)." % (
-                f.money(0), f.money(prev["spend"]), f.money(min_spend)),
+                f.money(0), f.money(prev_spend), f.money(min_spend)),
             "It produced %s conversions last week. The export does not say whether it was "
             "paused or ran out of budget." % f.count(prev["conversions"])))
     return flags
@@ -489,13 +657,17 @@ def metric_value(cur, metric, th):
     return cur["ctr"] if enough else None
 
 
+def spent_this_week(campaign):
+    return (campaign["current"]["spend"] or 0) > 0
+
+
 def median_comparison(campaigns, th):
     """Median CPA (or CTR when too few campaigns have conversions) per tag value vs overall.
 
     A tag value is reported only when at least median_min_campaigns_per_tag campaigns
     with enough volume carry it."""
     minimum = th["median_min_campaigns_per_tag"]
-    active = [c for c in campaigns if c["current"]["spend"] > 0]
+    active = [c for c in campaigns if spent_this_week(c)]
     scored = []
     for metric in ("CPA", "CTR"):
         scored = [(c, metric_value(c["current"], metric, th)) for c in active]
@@ -537,48 +709,112 @@ def median_comparison(campaigns, th):
 
 # --------------------------------------------------------------- analysis
 
+def source(row):
+    """The export a row came from. Coverage is checked per export."""
+    return row.get("file") or "the exports"
+
+
+def left_out_note(left_out, covered):
+    one = len(left_out) == 1
+    return ("%s %s left out of the totals and the week-over-week changes, because %s %s not cover "
+            "both weeks. The totals cover %s." % (
+                join_list(pretty_platform(p) for p in left_out), "is" if one else "are",
+                "its export" if one else "their exports", "does" if one else "do",
+                join_list(pretty_platform(p) for p in covered)))
+
+
 def analyze(rows, th, tag_table, week_ending=None):
-    """Build the full summary (numbers only) from normalized rows."""
+    """Build the full summary (numbers only) from normalized rows.
+
+    Raises InputError when the chosen week has no data."""
     if not rows:
         raise ValueError("no usable rows found in the exports")
     f = Fmt(th.get("currency_symbol", "$"))
-    end = week_ending or max(r["date"] for r in rows)
+    first_day, last_day = min(r["date"] for r in rows), max(r["date"] for r in rows)
+    if week_ending and week_ending > last_day:
+        raise InputError("--week-ending %s is after the last date in the exports (%s). Use %s or earlier."
+                         % (week_ending.isoformat(), last_day.isoformat(), last_day.isoformat()))
+    end = week_ending or last_day
     cur_w, prev_w = week_windows(end)
     cur_rows = [r for r in rows if in_window(r["date"], cur_w)]
     prev_rows = [r for r in rows if in_window(r["date"], prev_w)]
+    if not cur_rows:
+        raise InputError("no rows fall in the week ending %s (%s). The exports run from %s to %s."
+                         % (end.isoformat(), window_label(cur_w), first_day.isoformat(),
+                            last_day.isoformat()))
     notes = []
     outside = len(rows) - len(cur_rows) - len(prev_rows)
     if outside:
-        notes.append("%d rows fall outside the two weeks and were left out." % outside)
+        notes.append("%s outside the two weeks and %s left out." % (
+            plural(outside, "row falls", "rows fall"), "was" if outside == 1 else "were"))
     for label, window, subset in (("This week", cur_w, cur_rows), ("Last week", prev_w, prev_rows)):
         days = len({r["date"] for r in subset})
         if days < 7:
             notes.append("%s (%s) has data for %d of 7 days." % (label, window_label(window), days))
 
-    total_c = derive(group(cur_rows, lambda r: "all").get("all", new_agg()))
-    total_p = derive(group(prev_rows, lambda r: "all").get("all", new_agg()))
-    totals = {"current": total_c, "previous": total_p, "change": changes(total_c, total_p)}
+    # Coverage per export: an export without last week's rows can't say a campaign is new.
+    has_cur, has_prev = {source(r) for r in cur_rows}, {source(r) for r in prev_rows}
+    for name in sorted({source(r) for r in rows}):
+        if name in has_cur and name not in has_prev:
+            notes.append("%s: no data for last week (%s), so its campaigns are not compared with last "
+                         "week and none are flagged as new." % (name, window_label(prev_w)))
+        elif name in has_prev and name not in has_cur:
+            notes.append("%s: no data for this week (%s), so its campaigns are not compared with last "
+                         "week and none are flagged as stopped." % (name, window_label(cur_w)))
+        elif name not in has_cur:
+            notes.append("%s: no rows in either week, so it is not in the report." % name)
+    both = has_cur & has_prev
+    platform_sources = {}
+    for r in cur_rows + prev_rows:
+        platform_sources.setdefault(r["platform"], set()).add(source(r))
+    comparable = sorted(p for p, names in platform_sources.items() if names <= both)
+    left_out = sorted(p for p in platform_sources if p not in comparable)
+
+    if comparable:
+        scope = set(comparable)
+        total_c = total(r for r in cur_rows if r["platform"] in scope)
+        total_p = total(r for r in prev_rows if r["platform"] in scope)
+        note = left_out_note(left_out, comparable) if left_out else None
+    else:
+        scope = set(platform_sources)
+        total_c, total_p = total(cur_rows), unknown_week()
+        note = "No platform has data for both weeks, so the totals show this week only."
+    totals = {"current": total_c, "previous": total_p, "change": changes(total_c, total_p),
+              "platforms": sorted(scope), "left_out": left_out if comparable else [], "note": note}
+    if note:
+        notes.append(note)
+    roas_left_out = sorted({r["platform"] for r in cur_rows + prev_rows
+                            if r["platform"] in scope and r["revenue"] is None and r["spend"] > 0})
 
     platforms = []
     plat_c = group(cur_rows, lambda r: r["platform"])
     plat_p = group(prev_rows, lambda r: r["platform"])
-    for name in sorted(set(plat_c) | set(plat_p), key=lambda p: -(plat_c.get(p) or new_agg())["spend"]):
-        c, p = derive(plat_c.get(name) or new_agg()), derive(plat_p.get(name) or new_agg())
-        platforms.append({"platform": name, "current": c, "previous": p, "change": changes(c, p)})
+    for name in sorted(platform_sources, key=lambda p: (-(plat_c[p]["spend"] if p in plat_c else 0.0), p)):
+        c = derive(plat_c[name]) if name in plat_c else unknown_week()
+        p = derive(plat_p[name]) if name in plat_p else unknown_week()
+        compared = name in comparable
+        platforms.append({"platform": name, "current": c, "previous": p, "compared": compared,
+                          "change": changes(c, p) if compared else changes(unknown_week(), unknown_week())})
 
     key_fn = lambda r: (r["platform"], r["campaign"])
     camp_c, camp_p = group(cur_rows, key_fn), group(prev_rows, key_fn)
+    camp_sources = {}
+    for r in cur_rows + prev_rows:
+        camp_sources.setdefault(key_fn(r), set()).add(source(r))
     naming = th.get("tags_from_names", {})
-    campaigns, flags = [], []
-    for key in sorted(set(camp_c) | set(camp_p)):
-        c, p = derive(camp_c.get(key) or new_agg()), derive(camp_p.get(key) or new_agg())
+    campaigns, flags, from_names = [], [], set()
+    for key in sorted(camp_sources):
+        cur_known, prev_known = camp_sources[key] <= has_cur, camp_sources[key] <= has_prev
+        c = derive(camp_c[key]) if key in camp_c else (derive(new_agg()) if cur_known else unknown_week())
+        p = derive(camp_p[key]) if key in camp_p and prev_known else \
+            (derive(new_agg()) if prev_known else unknown_week())
+        compare_c = c if cur_known else unknown_week()
         campaigns.append({"platform": key[0], "campaign": key[1], "tags": tags_for(key[1], tag_table, naming),
-                          "current": c, "previous": p, "change": changes(c, p)})
-        flags += campaign_flags(key[1], key[0], c, p, th, f)
-    campaigns.sort(key=lambda c: -c["current"]["spend"])
-    if not prev_rows:  # without a last week, every campaign would look new
-        flags = [x for x in flags if x["rule"] != "new"]
-        notes.append("There is no data for last week, so new-campaign flags and comparisons are off.")
+                          "current": c, "previous": p, "change": changes(compare_c, p)})
+        flags += campaign_flags(key[1], key[0], compare_c, p, th, f)
+        table_tags = tag_table.get(key[1].lower(), {})
+        from_names |= {t for t in name_tags(key[1], naming) if t not in table_tags}
+    campaigns.sort(key=lambda c: -(c["current"]["spend"] or 0.0))
     flags = sort_flags(flags)
 
     medians = median_comparison(campaigns, th)
@@ -592,6 +828,10 @@ def analyze(rows, th, tag_table, week_ending=None):
             notes.append("Not enough campaigns to compare (need %d with enough volume; counted of total "
                          "in brackets): %s." % (
                 th["median_min_campaigns_per_tag"], ", ".join(small)))
+    if from_names:
+        notes.append("Tags read from campaign names: %s (split on '%s', set by tags_from_names in "
+                     "config/thresholds.json). A tags file passed with --tags overrides them." % (
+                         ", ".join(sorted(from_names)), naming.get("delimiter", "_")))
     notes += missing_tag_notes(campaigns)
 
     return {"week_ending": end.isoformat(),
@@ -599,11 +839,11 @@ def analyze(rows, th, tag_table, week_ending=None):
             "previous_window": [d.isoformat() for d in prev_w],
             "look_first": pick_look_first(flags, totals, f),
             "totals": totals, "platforms": platforms, "campaigns": campaigns,
-            "movers": flags, "medians": medians, "data_notes": notes}
+            "movers": flags, "medians": medians, "roas_left_out": roas_left_out, "data_notes": notes}
 
 
 def missing_tag_notes(campaigns):
-    active = [c for c in campaigns if c["current"]["spend"] > 0]
+    active = [c for c in campaigns if spent_this_week(c)]
     dims = sorted({t for c in active for t in c["tags"]})
     notes = []
     for dim in dims:
@@ -618,33 +858,59 @@ def missing_tag_notes(campaigns):
 def file_notes(results, th):
     notes = []
     for r in results:
+        name = r["file"]
         if r["error"]:
-            notes.append("%s: skipped, %s." % (r["file"], r["error"]))
+            notes.append("%s: skipped, %s." % (name, r["error"]))
             continue
-        line = "%s: read as %s, %d rows used." % (r["file"], pretty_platform(r["platform"]), len(r["rows"]))
+        line = "%s: read as %s%s, %s used." % (
+            name, pretty_platform(r["platform"]), " (set with --platform)" if r["platform_forced"] else "",
+            plural(len(r["rows"]), "row", "rows"))
         if r["platform"] == "unknown":
-            line += " Platform not detected. Use --platform meta, google or linkedin."
+            line += (" Platform not detected. Run again with --platform meta, google or linkedin to name "
+                     "it. The flag only changes files whose platform is not detected.")
         notes.append(line)
         if r["preamble_lines"]:
-            notes.append("%s: %d lines above the header were skipped." % (r["file"], r["preamble_lines"]))
+            n = r["preamble_lines"]
+            notes.append("%s: %s above the header %s skipped." % (
+                name, plural(n, "line", "lines"), "was" if n == 1 else "were"))
         for reason, count in sorted(r["skipped"].items()):
-            notes.append("%s: %d %s skipped, %s." % (
-                r["file"], count, "row" if count == 1 else "rows", reason))
+            notes.append("%s: %s skipped, %s." % (name, plural(count, "row", "rows"), reason))
+        if r["duplicates"]:
+            n, earlier = r["duplicates"], join_list(r["duplicate_of"])
+            if n == 1:
+                text = "1 row was an exact copy of a row in %s" % earlier
+            else:
+                text = "%d rows were exact copies of rows in %s" % (n, earlier)
+            notes.append("%s: %s (same platform, campaign, date and numbers), so %s dropped." % (
+                name, text, "it was" if n == 1 else "they were"))
         if r["unknown_columns"]:
-            notes.append("%s: unknown columns ignored: %s." % (r["file"], ", ".join(r["unknown_columns"])))
+            notes.append("%s: unknown columns ignored: %s." % (name, ", ".join(r["unknown_columns"])))
         if r["blank_cells"]:
             cells = ", ".join("%s (%d)" % kv for kv in sorted(r["blank_cells"].items()))
-            notes.append("%s: blank or '--' cells read as 0 in %s." % (r["file"], cells))
+            notes.append("%s: blank or '--' cells read as 0 in %s." % (name, cells))
+        if r["revenue_blank"]:
+            notes.append("%s: the revenue column is blank in every row, so it is treated as missing and "
+                         "this file's spend is left out of ROAS." % name)
+        if normalize_header(r["conversions_column"] or "") == "results":
+            notes.append("%s: conversions come from Meta's Results column, which counts whatever each "
+                         "campaign optimizes for (purchases, leads, link clicks). Check that the "
+                         "campaigns you compare count the same result." % name)
         if r["number_style"] == "comma":
             notes.append("%s: numbers read as European style (comma decimal, dot thousands)%s." % (
-                r["file"], ", as set by --decimal-comma" if r["forced_decimal_comma"] else ""))
+                name, ", as set by --decimal-comma" if r["forced_decimal_comma"] else ""))
         elif r["number_style"] == "ambiguous":
             notes.append("%s: the number format was ambiguous (values like 1,234 could be either style). "
                          "Assumed US style: comma for thousands, dot for decimals. If this is a European "
-                         "export, run again with --decimal-comma." % r["file"])
+                         "export, run again with --decimal-comma." % name)
+        if r["date_order"] == "day":
+            example = datetime.strptime(r["date_example"], "%d/%m/%Y").date()
+            notes.append("%s: dates read day first (%s is %s)." % (name, r["date_example"], long_date(example)))
+        elif r["date_order"] == "ambiguous":
+            notes.append("%s: dates like %s could be month first or day first. They were read month "
+                         "first (US style)." % (name, r["date_example"]))
         if r["currency"] and r["currency"] != th["currency_code"]:
-            notes.append("%s: the spend header says %s but the report assumes %s." % (
-                r["file"], r["currency"], th["currency_code"]))
+            notes.append("%s: the export's currency is %s, but the report assumes %s." % (
+                name, r["currency"], th["currency_code"]))
     notes.append("Currency: all amounts are treated as %s. The tool does not convert currencies." %
                  th["currency_code"])
     notes.append("Each platform counts conversions and revenue by its own rules, so the same "
@@ -672,16 +938,20 @@ TOTAL_ROWS = [("Spend", "spend", "money"), ("Impressions", "impressions", "count
 def render_markdown(s, f):
     cur_w, prev_w = [date.fromisoformat(d) for d in s["current_window"]], \
                     [date.fromisoformat(d) for d in s["previous_window"]]
+    end = date.fromisoformat(s["week_ending"])
     t = s["totals"]
     out = [s["look_first"], "", "# Weekly campaign report", "",
-           "Week ending %s. This week is %s, compared with %s. Every figure comes from the exports "
-           "you supplied." % (s["week_ending"], window_label(cur_w), window_label(prev_w)), "",
+           "Week ending %s %s. This week is %s, compared with %s. Every figure comes from the exports "
+           "you supplied." % (WEEKDAYS[end.weekday()], s["week_ending"], window_label(cur_w),
+                              window_label(prev_w)), "",
            "## Totals", ""]
-    if s.get("currency_mismatch"):
-        out[6:6] = ["Check the currency first: %s uses a different currency than %s. This report shows "
+    mismatch = s.get("currency_mismatch")
+    if mismatch:
+        out[6:6] = ["Check the currency first: %s %s a different currency than %s. This report shows "
                     "every amount as %s and does not convert. Set `currency_code` and `currency_symbol` "
                     "in `config/thresholds.json` if all your files share one currency." % (
-                        ", ".join(s["currency_mismatch"]), s["currency_code"], s["currency_code"]), ""]
+                        join_list(mismatch), "uses" if len(mismatch) == 1 else "use",
+                        s["currency_code"], s["currency_code"]), ""]
     rows = []
     for label, key, kind in TOTAL_ROWS:
         if t["current"][key] is None and t["previous"][key] is None:
@@ -689,12 +959,17 @@ def render_markdown(s, f):
         rows.append([label, f.show(kind, t["current"][key]), f.show(kind, t["previous"][key]),
                      f.change(t["change"][key])])
     out += md_table(["", "This week", "Last week", "Change"], rows)
-    no_revenue = [pretty_platform(p["platform"]) for p in s["platforms"] if p["current"]["revenue"] is None]
-    out += ["", "Conversions are counted by each platform's own rules, so treat the totals as a "
-            "sum of platform numbers."]
+    out.append("")
+    if t.get("note"):
+        out.append(t["note"])
+    out.append("Conversions are counted by each platform's own rules, so treat the totals as a "
+               "sum of platform numbers.")
+    no_revenue = [pretty_platform(p["platform"]) for p in s["platforms"]
+                  if p["platform"] in s.get("roas_left_out", [])]
     if no_revenue:
-        out.append("Revenue and ROAS leave out %s, which has no revenue column in its export." %
-                   ", ".join(no_revenue))
+        one = len(no_revenue) == 1
+        out.append("Revenue and ROAS leave out %s, which %s no revenue data in %s." % (
+            join_list(no_revenue), "has" if one else "have", "its export" if one else "their exports"))
     out += ["", "## By platform", ""]
     rows = []
     for p in s["platforms"]:
@@ -762,10 +1037,11 @@ def run(paths, tags_path=None, week_ending=None, platform=None, config_dir=CONFI
     """Read the exports and return (markdown, summary)."""
     cols, th = load_config(config_dir)
     results = [read_export(p, cols, platform, decimal_comma) for p in paths]
+    clash_notes = drop_duplicates(results)
     rows = [row for r in results for row in r["rows"]]
     tag_table = load_tags_csv(tags_path) if tags_path else {}
     summary = analyze(rows, th, tag_table, week_ending)
-    summary["data_notes"] = file_notes(results, th) + summary["data_notes"]
+    summary["data_notes"] = clash_notes + file_notes(results, th) + summary["data_notes"]
     summary["currency_mismatch"] = ["%s (%s)" % (r["file"], r["currency"]) for r in results
                                     if r["currency"] and r["currency"] != th["currency_code"]]
     summary["currency_code"] = th["currency_code"]
@@ -783,7 +1059,8 @@ def main(argv=None):
     parser.add_argument("exports", nargs="*", help="CSV exports from Meta, Google or LinkedIn")
     parser.add_argument("--tags", help="tags CSV: campaign, then one column per tag")
     parser.add_argument("--week-ending", help="last day of the current week, YYYY-MM-DD (default: latest date in the data)")
-    parser.add_argument("--platform", choices=sorted(PLATFORM_NAMES), help="force the platform for all files")
+    parser.add_argument("--platform", choices=sorted(PLATFORM_NAMES),
+                        help="platform for files whose platform can't be detected (detected files keep theirs)")
     parser.add_argument("--out", help="markdown report path (default: ./out/report.md in the current folder)")
     parser.add_argument("--summary", help="JSON summary path (default: summary.json next to the report)")
     parser.add_argument("--decimal-comma", action="store_true",
@@ -809,6 +1086,9 @@ def main(argv=None):
             parser.error("--week-ending must look like 2026-03-15")
     try:
         markdown, summary = run(paths, tags, week_ending, args.platform, decimal_comma=args.decimal_comma)
+    except InputError as error:
+        print("Error: %s" % error, file=sys.stderr)
+        return 2
     except (OSError, ValueError) as error:
         print("Error: %s" % error, file=sys.stderr)
         return 1
